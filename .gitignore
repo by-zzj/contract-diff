@@ -1,0 +1,16 @@
+node_modules/
+dist/
+dist-electron/
+release/
+backend/venv/
+backend/build/
+backend/dist/
+backend/dist_pp/
+backend/__pycache__/
+backend/**/__pycache__/
+backend/*.pyc
+backend/**/*.pyc
+*.log
+.contract_diff_cache/
+.DS_Store
+Thumbs.db

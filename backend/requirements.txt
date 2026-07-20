@@ -1,0 +1,15 @@
+# OCR Engine
+paddleocr>=3.0.0,<4.0.0
+paddlepaddle>=2.6.0,<3.0.0
+
+# Image Processing
+opencv-python-headless>=4.8.0,<5.0.0
+numpy>=1.24.0,<2.0.0
+
+# Document Parsing
+PyMuPDF>=1.23.0,<2.0.0
+python-docx>=0.8.11,<2.0.0
+Pillow>=10.0.0,<11.0.0
+
+# Text Processing
+jieba>=0.42.1
