@@ -9,16 +9,13 @@ PaddleOCR 引擎封装 — 单例模式，懒加载。
 """
 
 import logging
+import re
 from pathlib import Path
 from typing import Optional
 from dataclasses import dataclass, field
 
 import numpy as np
-
-from .preprocess import (
-    assess_quality, enhance, resize_if_needed,
-    ImageQuality,
-)
+from .preprocess import ImageQuality
 
 logger = logging.getLogger(__name__)
 
@@ -68,11 +65,14 @@ class OCREngine:
                 use_gpu=False,             # CPU 推理
                 show_log=False,
             )
-            logger.info("PaddleOCR 模型加载完成 (PP-OCRv4)")
+            logger.info("PaddleOCR 模型加载完成 (PP-OCRv4, 中文 97%+)")
         except ImportError:
             raise RuntimeError(
                 "PaddleOCR 未安装。请运行: pip install paddleocr"
             )
+        except Exception as e:
+            logger.error(f"PaddleOCR 初始化失败: {e}")
+            raise
 
     def recognize(
         self,
@@ -82,21 +82,17 @@ class OCREngine:
         page_index: int = 0,
         dpi: int = 150,
     ) -> OCRResult:
-        """
-        识别单张图片中的文本。
-
-        Args:
-            image_path: 图片文件路径（与 image_array 二选一）
-            image_array: numpy 图片数组（与 image_path 二选一）
-            page_index: 页码索引
-            dpi: 图片 DPI
-
-        Returns:
-            OCRResult 识别结果
-        """
+        """识别单张图片中的文本。PaddleOCR 自带预处理，不额外二值化。"""
         if image_path is not None:
             import cv2
+            # OpenCV imread 不支持中文路径，用 PIL 读再转 numpy
             img = cv2.imread(image_path)
+            if img is None:
+                from PIL import Image
+                pil_img = Image.open(image_path)
+                img = np.array(pil_img)
+                if img.ndim == 3 and img.shape[2] == 3:
+                    img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
             if img is None:
                 raise ValueError(f"无法读取图片: {image_path}")
         elif image_array is not None:
@@ -104,17 +100,21 @@ class OCREngine:
         else:
             raise ValueError("必须提供 image_path 或 image_array")
 
-        # 缩放大图
-        img = resize_if_needed(img)
+        import cv2
 
-        # 质量评估
-        quality = assess_quality(img, dpi)
+        # 图片缩放优化（不二值化，PaddleOCR 内部有完整预处理管线）
+        h, w = img.shape[:2]
+        if w < 1000 and h < 1500:
+            # 小图放大到 1600px 宽，提升文字细节
+            scale = 1600 / w
+            img = cv2.resize(img, (1600, int(h * scale)), interpolation=cv2.INTER_CUBIC)
+        elif max(w, h) > 3000:
+            # 大图缩小防内存溢出
+            scale = 2400 / max(w, h)
+            img = cv2.resize(img, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
 
-        # 预处理增强
-        enhanced = enhance(img, dpi)
-
-        # PaddleOCR 识别
-        results = OCREngine._ocr.ocr(np.array(enhanced), cls=True)
+        # 直接送 PaddleOCR（PP-OCRv4 内部有完整的预处理管线，不额外二值化）
+        results = OCREngine._ocr.ocr(img, cls=True)
 
         # 提取结构化结果
         blocks = []
@@ -134,26 +134,47 @@ class OCREngine:
                     'y_center': y_center,
                 })
 
-        # 按 y 坐标排序块，然后按 x 坐标（处理多栏）
-        blocks.sort(key=lambda b: (round(b['y_center'] / 30) * 30, b['bbox'][0][0]))
+        # 按 y 坐标每 40px 一个桶，桶内按 x 坐标排序（严格阅读顺序）
+        blocks.sort(key=lambda b: (
+            round(b['y_center'] / 40) * 40,
+            b['bbox'][0][0]
+        ))
 
         all_text_parts = []
         total_conf = 0.0
         count = 0
 
         for block in blocks:
-            all_text_parts.append(block['text'])
+            text = _ocr_postprocess(block['text'])
+            # 过滤页码/页眉噪声：单数字(<3位)在页面顶部或底部
+            if _is_page_noise(text, block['y_center'], blocks, block['confidence']):
+                continue
+            all_text_parts.append(text)
             total_conf += block['confidence']
             count += 1
 
         avg_conf = total_conf / count if count > 0 else 0.0
         full_text = '\n'.join(all_text_parts)
 
+        # 日志：OCR 识别详情
+        logger.info(
+            f"OCR 完成 page={page_index}: {len(blocks)} 行文本, "
+            f"置信度={avg_conf:.3f}"
+        )
+        low_conf_blocks = [b for b in blocks if b['confidence'] < 0.8]
+        if low_conf_blocks:
+            logger.warning(
+                f"  低置信度文本 ({len(low_conf_blocks)} 处): " +
+                "; ".join(f"{b['text'][:30]} ({b['confidence']:.2f})" for b in low_conf_blocks[:5])
+            )
+        # 前几行识别结果
+        for b in blocks[:8]:
+            logger.debug(f"  [{b['confidence']:.3f}] {b['text'][:80]}")
+
         return OCRResult(
             text=full_text,
             confidence=avg_conf,
             blocks=blocks,
-            quality=quality,
             page_index=page_index,
         )
 
@@ -194,3 +215,44 @@ class OCREngine:
     def is_ready(self) -> bool:
         """引擎是否已初始化就绪。"""
         return OCREngine._ocr is not None
+
+
+# ── OCR 文本后处理 ────────────────────────────────────────
+
+def _ocr_postprocess(text: str) -> str:
+    """
+    修正常见 OCR 不稳定字符。
+
+    两次截图同一段文字，OCR 可能识别为 '、' 或 '"' 或 '·'，
+    统一规整以减少无意义差异。
+    """
+    # 不稳定标点 → 统一
+    text = text.replace('‘', '、').replace('\'', '、')
+    text = text.replace('·', '。')
+    text = text.replace('"', '"').replace('"', '"')
+
+    # 去除 OCR 残留的零宽字符和控制符
+    text = text.replace('​', '').replace('‌', '').replace('‍', '')
+    text = text.replace('﻿', '')
+
+    # c→C 修正（合同文档中 C 区 比 c 区 更常见）
+    if 'c区' in text:
+        text = text.replace('c区', 'C区')
+
+    return text
+
+
+def _is_page_noise(text: str, y_center: float, all_blocks: list, conf: float) -> bool:
+    """判断是否为页码/页眉噪声。"""
+    stripped = text.strip()
+    # 纯数字 (1-3位，可能是页码)
+    if re.match(r'^\d{1,3}$', stripped):
+        if all_blocks:
+            max_y = max(b['y_center'] for b in all_blocks)
+            # 在页面顶部 15% 或底部 15% → 页码
+            if y_center < max_y * 0.15 or y_center > max_y * 0.85:
+                return True
+    # 低置信度 + 极短文本 + 在页面边缘 → 噪声
+    if conf < 0.6 and len(stripped) <= 2:
+        return True
+    return False

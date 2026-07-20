@@ -7,6 +7,7 @@ import { FileGroupList } from './components/FileGroupList';
 import { ProcessingStatus } from './components/ProcessingStatus';
 import { DiffResultList } from './components/DiffResultList';
 import { ExportButton } from './components/ExportButton';
+import { OcrPreviewPanel } from './components/OcrPreviewPanel';
 
 /**
  * 应用主组件。
@@ -17,8 +18,12 @@ import { ExportButton } from './components/ExportButton';
 const App: React.FC = () => {
   const bridge = usePythonBridge();
   const diff = useDiffState();
-  // 操作级错误（比对失败等），不影响后端连接状态
   const [operationError, setOperationError] = useState<string | null>(null);
+  // OCR 预览文本
+  const [ocrPreview, setOcrPreview] = useState<{
+    original: { fileName: string; text: string; confidence: number }[];
+    compared: { fileName: string; text: string; confidence: number }[];
+  } | null>(null);
 
   // ── 开始比对 ──────────────────────────────────────────
 
@@ -48,6 +53,30 @@ const App: React.FC = () => {
       });
 
       diff.setOCRResults(origResult.pages, compResult.pages);
+
+      // 收集 OCR 预览文本
+      const ogrp: Record<string, { text: string; conf: number }> = {};
+      for (const p of origResult.pages) {
+        const key = p.source_file || '';
+        if (!ogrp[key]) ogrp[key] = { text: '', conf: 0 };
+        ogrp[key].text += (ogrp[key].text ? '\n' : '') + p.text;
+        ogrp[key].conf = Math.max(ogrp[key].conf, p.confidence);
+      }
+      const cgrp: Record<string, { text: string; conf: number }> = {};
+      for (const p of compResult.pages) {
+        const key = p.source_file || '';
+        if (!cgrp[key]) cgrp[key] = { text: '', conf: 0 };
+        cgrp[key].text += (cgrp[key].text ? '\n' : '') + p.text;
+        cgrp[key].conf = Math.max(cgrp[key].conf, p.confidence);
+      }
+      setOcrPreview({
+        original: Object.entries(ogrp).map(([k, v]) => ({
+          fileName: k.split(/[/\\]/).pop() || k, text: v.text, confidence: v.conf,
+        })),
+        compared: Object.entries(cgrp).map(([k, v]) => ({
+          fileName: k.split(/[/\\]/).pop() || k, text: v.text, confidence: v.conf,
+        })),
+      });
 
       const diffResult = await bridge.call('diff.compare', {
         original_pages: origResult.pages,
@@ -180,6 +209,10 @@ const App: React.FC = () => {
               records={diff.filteredRecords}
               summary={diff.diffSummary}
             />
+            {/* OCR 识别文本预览 */}
+            {ocrPreview && (
+              <OcrPreviewPanel preview={ocrPreview} />
+            )}
           </>
         )}
       </main>

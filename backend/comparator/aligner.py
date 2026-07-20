@@ -111,7 +111,7 @@ def _text_similarity(a: str, b: str) -> float:
     """
     计算两段文本的相似度。
 
-    使用 SequenceMatcher 比较，对极短文本做惩罚。
+    使用 SequenceMatcher 比较，对极短文本做温和处理。
     """
     if not a and not b:
         return 1.0
@@ -121,9 +121,9 @@ def _text_similarity(a: str, b: str) -> float:
     sm = SequenceMatcher(None, a, b)
     ratio = sm.ratio()
 
-    # 短文本惩罚：文本越短，ratio 越不可靠
+    # 短文本处理：过于激进地惩罚会导致标题永远无法匹配
     min_len = min(len(a), len(b))
-    if min_len < 10:
-        ratio *= min_len / 10
+    if min_len < 5:
+        ratio *= max(0.7, min_len / 5)
 
     return ratio

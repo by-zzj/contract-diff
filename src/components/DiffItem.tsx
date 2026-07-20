@@ -16,17 +16,21 @@ const TYPE_COLORS: Record<string, { bg: string; badge: string; label: string }> 
  */
 export const DiffItem: React.FC<Props> = ({ record }) => {
   const colors = TYPE_COLORS[record.type] || TYPE_COLORS.modified;
+  const isLowConfidence = record.confidence < 0.85;
+  // 检查是否有低置信度片段
+  const hasLowConfFrag = record.fragments.some(f => (f.ocrConfidence ?? 1) < 0.85);
 
   return (
-    <div className="diff-item" style={{ borderLeftColor: colors.badge }}>
+    <div className={`diff-item ${isLowConfidence ? 'low-confidence' : ''}`} style={{ borderLeftColor: colors.badge }}>
       {/* 头部 */}
       <div className="diff-item-header">
         <span className="diff-badge" style={{ background: colors.badge }}>
           {colors.label}
         </span>
         <span className="diff-page-label">{record.pageLabel}</span>
-        <span className="diff-confidence">
-          OCR 置信度 {(record.confidence * 100).toFixed(0)}%
+        <span className={`diff-confidence ${isLowConfidence ? 'low' : ''}`}>
+          {isLowConfidence ? '⚠️ ' : ''}
+          OCR {(record.confidence * 100).toFixed(0)}%
         </span>
       </div>
 

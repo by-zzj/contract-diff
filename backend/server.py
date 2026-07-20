@@ -22,15 +22,29 @@ if hasattr(sys.stdout, 'buffer'):
 if hasattr(sys.stderr, 'buffer'):
     sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
 
-# ── 日志配置（stderr + 文件双写）─────────────────────────
-LOG_DIR = Path(os.environ.get("CONTRACT_DIFF_LOG_DIR", Path.home() / ".contract-diff" / "logs"))
-LOG_DIR.mkdir(parents=True, exist_ok=True)
-LOG_FILE = LOG_DIR / "backend.log"
+# ── 日志配置（双写：项目目录 + 用户目录）─────────────────
+LOG_DIR_HOME = Path.home() / ".contract-diff" / "logs"
+LOG_DIR_HOME.mkdir(parents=True, exist_ok=True)
+
+# 项目目录下也写一份，方便用户直接打开
+LOG_DIR_PROJECT = Path(__file__).resolve().parent.parent / "logs"
+LOG_DIR_PROJECT.mkdir(parents=True, exist_ok=True)
+
+LOG_FILE = LOG_DIR_PROJECT / "backend.log"  # 项目目录下的日志
 
 # 文件 handler（errors='replace' 防止乱码导致日志崩溃）
 file_handler = logging.FileHandler(str(LOG_FILE), encoding="utf-8", errors="replace")
 file_handler.setLevel(logging.DEBUG)
 file_handler.setFormatter(logging.Formatter(
+    "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+))
+
+# 用户目录也写一份
+file_handler_home = logging.FileHandler(
+    str(LOG_DIR_HOME / "backend.log"), encoding="utf-8", errors="replace"
+)
+file_handler_home.setLevel(logging.DEBUG)
+file_handler_home.setFormatter(logging.Formatter(
     "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
 ))
 
@@ -43,10 +57,12 @@ stderr_handler.setFormatter(logging.Formatter("[%(levelname)s] %(name)s: %(messa
 root_logger = logging.getLogger()
 root_logger.setLevel(logging.DEBUG)
 root_logger.addHandler(file_handler)
+root_logger.addHandler(file_handler_home)
 root_logger.addHandler(stderr_handler)
 
 logger = logging.getLogger("contract-diff")
 logger.info(f"日志文件: {LOG_FILE}")
+logger.info(f"备份日志: {LOG_DIR_HOME / 'backend.log'}")
 
 # ── 延迟导入（加快启动，按需加载）───────────────────────
 
@@ -57,6 +73,10 @@ _parsers_cache = {}
 def _get_engine():
     global _engine
     if _engine is None:
+        # 保存日志配置（PaddleOCR 初始化会重置 logging level）
+        saved_handlers = list(root_logger.handlers)
+        saved_level = root_logger.level
+
         # 自动检测最佳可用引擎：PaddleOCR > EasyOCR > Tesseract > Demo
         # 1. PaddleOCR（中文准确率最高 97%+，PP-OCRv4）
         try:
@@ -66,6 +86,12 @@ def _get_engine():
             return _engine
         except Exception as e:
             logger.info(f"PaddleOCR 不可用: {e}")
+        finally:
+            # 恢复日志配置（PaddleOCR 会改 root level 为 WARNING）
+            root_logger.setLevel(saved_level)
+            if not root_logger.handlers:
+                for h in saved_handlers:
+                    root_logger.addHandler(h)
 
         # 2. EasyOCR（PyTorch 备选，中文 ~95%）
         try:
@@ -180,8 +206,10 @@ def handle_process_files(params: dict) -> dict:
     all_pages = []
 
     for file_path in files:
+        logger.info(f"处理文件: {file_path}")
         parser = BaseParser.get_parser(file_path)
         parsed = parser.parse(file_path)
+        logger.info(f"  解析完成: {len(parsed)} 页")
 
         for page in parsed:
             if page.image_path:
@@ -191,6 +219,12 @@ def handle_process_files(params: dict) -> dict:
                     image_path=page.image_path,
                     page_index=page.page_index,
                 )
+                logger.info(
+                    f"  OCR 第{page.page_index}页: {len(result.text)}字, "
+                    f"置信度={result.confidence:.3f}"
+                )
+                # 前 200 字预览
+                logger.info(f"  文本预览: {result.text[:200]}")
                 all_pages.append({
                     "text": result.text,
                     "confidence": round(result.confidence, 3),
@@ -201,6 +235,11 @@ def handle_process_files(params: dict) -> dict:
                 })
             elif page.raw_text:
                 # 文字型 → 直接使用
+                logger.info(
+                    f"  Word文本 第{page.page_index}页: "
+                    f"{len(page.raw_text)}字"
+                )
+                logger.info(f"  文本预览: {page.raw_text[:200]}")
                 all_pages.append({
                     "text": page.raw_text,
                     "confidence": 1.0,
@@ -231,26 +270,43 @@ def handle_diff(params: dict) -> dict:
     if not original_pages and not compared_pages:
         return {"records": [], "summary": {"total": 0, "modified": 0, "deleted": 0, "added": 0}}
 
-    # 拼接全文
-    orig_text = "\n\n".join(p.get("text", "") for p in original_pages)
-    comp_text = "\n\n".join(p.get("text", "") for p in compared_pages)
+    # 检测场景
+    has_ocr_orig = any(p.get("is_ocr") for p in original_pages)
+    has_ocr_comp = any(p.get("is_ocr") for p in compared_pages)
 
-    # 取最低置信度
+    if has_ocr_orig and has_ocr_comp:
+        strategy = "行级匹配 (OCR vs OCR)"
+    elif has_ocr_orig or has_ocr_comp:
+        strategy = "行级匹配 (OCR vs Word)"
+    else:
+        strategy = "段落级匹配 (Word vs Word)"
+
+    logger.info(f"比对策略: {strategy}")
+
+    # 先全文比对（避免 Word 40段/页 vs PDF 真页边界不一致）
+    orig_all = "\n\n".join(p.get("text", "") for p in original_pages)
+    comp_all = "\n\n".join(p.get("text", "") for p in compared_pages)
+
     orig_conf = min((p.get("confidence", 0.95) for p in original_pages), default=0.95)
     comp_conf = min((p.get("confidence", 0.95) for p in compared_pages), default=0.95)
     base_conf = min(orig_conf, comp_conf)
 
+    logger.info(
+        f"开始比对: 原件={len(orig_all)}字, 比对件={len(comp_all)}字, "
+        f"策略={strategy}"
+    )
+
     from comparator.differ import compare
-    records = compare(
-        original_text=orig_text,
-        compared_text=comp_text,
+    all_records = compare(
+        original_text=orig_all,
+        compared_text=comp_all,
         page_label="全文比对",
         base_confidence=base_conf,
     )
 
     # 转 dict
     records_data = []
-    for r in records:
+    for r in all_records:
         records_data.append({
             "id": r.id,
             "pageLabel": r.page_label,
@@ -269,17 +325,31 @@ def handle_diff(params: dict) -> dict:
                     "originalEnd": getattr(f, 'original_end', 0),
                     "comparedStart": getattr(f, 'compared_start', 0),
                     "comparedEnd": getattr(f, 'compared_end', 0),
+                    "ocrConfidence": round(r.confidence, 3),
                 }
                 for f in r.fragments
             ],
         })
 
     summary = {
-        "total": len(records),
-        "modified": sum(1 for r in records if r.type == "modified"),
-        "deleted": sum(1 for r in records if r.type == "deleted"),
-        "added": sum(1 for r in records if r.type == "added"),
+        "total": len(all_records),
+        "modified": sum(1 for r in all_records if r.type == "modified"),
+        "deleted": sum(1 for r in all_records if r.type == "deleted"),
+        "added": sum(1 for r in all_records if r.type == "added"),
     }
+
+    logger.info(
+        f"比对完成: {summary['total']} 条差异 "
+        f"(修改{summary['modified']}, 删除{summary['deleted']}, 新增{summary['added']})"
+    )
+    for r in all_records[:5]:  # 前 5 条差异详情
+        logger.info(
+            f"  [{r.type}] {r.page_label}\n"
+            f"    原件: {r.original_text[:80]}\n"
+            f"    比对件: {r.compared_text[:80]}"
+        )
+    if len(all_records) > 5:
+        logger.info(f"  ... 共 {len(all_records)} 条差异")
 
     return {"records": records_data, "summary": summary}
 

@@ -8,7 +8,8 @@ declare global {
       callBackend: (method: string, params?: any) => Promise<any>;
       retryBackend: () => Promise<boolean>;
       onBackendProgress: (callback: (data: any) => void) => () => void;
-      onBackendReady: (callback: () => void) => void;
+      onBackendReady: (callback: () => void) => () => void;
+      getBackendStatus: () => Promise<{ ready: boolean }>;
       onBackendError: (callback: (error: any) => void) => () => void;
       onBackendExited: (callback: (data: any) => void) => () => void;
       openFileDialog: (options?: any) => Promise<string[]>;

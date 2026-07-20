@@ -7,6 +7,8 @@ export interface DiffFragment {
   originalEnd: number;
   comparedStart: number;
   comparedEnd: number;
+  /** OCR 置信度（0-1），< 0.8 时前端显示低置信度警告 */
+  ocrConfidence?: number;
 }
 
 /** 单条差异记录 */
@@ -56,4 +58,6 @@ export interface FileEntry {
   path: string;
   name: string;
   group: FileGroup;
+  ocrText?: string;        // OCR 识别文本（图片/PDF文件）
+  ocrConfidence?: number;  // OCR 置信度
 }

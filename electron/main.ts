@@ -74,6 +74,13 @@ function setupIPC() {
     return pythonBridge.call(method, params);
   });
 
+  // 查询后端状态（解决竞态：React 挂载时后端可能已就绪）
+  ipcMain.handle('backend:getStatus', async () => {
+    return {
+      ready: pythonBridge?.isRunning ?? false,
+    };
+  });
+
   // 重新启动 Python 后端
   ipcMain.handle('backend:retry', async () => {
     pythonBridge?.stop();

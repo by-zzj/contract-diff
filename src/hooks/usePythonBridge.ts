@@ -32,8 +32,8 @@ export function usePythonBridge() {
       return () => {};
     }
 
-    // 监听后端就绪
-    api.onBackendReady(() => {
+    // 监听后端就绪（换成 on，含清理函数）
+    const unsubReady = api.onBackendReady(() => {
       setState(s => ({ ...s, isReady: true, error: null, initializing: false }));
     });
 
@@ -63,7 +63,15 @@ export function usePythonBridge() {
       }));
     });
 
+    // 主动查询：后端可能已经就绪（解决竞态条件）
+    api.getBackendStatus().then(status => {
+      if (status.ready) {
+        setState(s => ({ ...s, isReady: true, error: null, initializing: false }));
+      }
+    }).catch(() => {});
+
     return () => {
+      unsubReady();
       unsubProgress();
       unsubError();
       unsubExited();

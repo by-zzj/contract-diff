@@ -26,7 +26,14 @@ contextBridge.exposeInMainWorld('electronAPI', {
 
   /** 监听后端就绪 */
   onBackendReady: (callback: () => void) => {
-    ipcRenderer.once('backend:ready', () => callback());
+    const handler = () => callback();
+    ipcRenderer.on('backend:ready', handler);
+    return () => ipcRenderer.removeListener('backend:ready', handler);
+  },
+
+  /** 查询后端当前状态 */
+  getBackendStatus: (): Promise<{ ready: boolean }> => {
+    return ipcRenderer.invoke('backend:getStatus');
   },
 
   /** 监听后端错误 */
