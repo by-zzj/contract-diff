@@ -262,49 +262,89 @@ def handle_diff(params: dict) -> dict:
         compared_pages: [{text, page_index, ...}] — 比对件页面列表
 
     returns:
-        {records: [DiffRecord], summary: {total, modified, deleted, added}}
+        {records: [DiffRecord], summary: {total, modified, deleted, added},
+         page_alignment: [{orig_page, comp_page, similarity}]}
     """
     original_pages = params.get("original_pages", [])
     compared_pages = params.get("compared_pages", [])
 
     if not original_pages and not compared_pages:
-        return {"records": [], "summary": {"total": 0, "modified": 0, "deleted": 0, "added": 0}}
+        return {
+            "records": [],
+            "summary": {"total": 0, "modified": 0, "deleted": 0, "added": 0},
+            "page_alignment": [],
+        }
 
     # 检测场景
     has_ocr_orig = any(p.get("is_ocr") for p in original_pages)
     has_ocr_comp = any(p.get("is_ocr") for p in compared_pages)
 
+    n_orig = len(original_pages)
+    n_comp = len(compared_pages)
+
+    # 策略选择: 多页(>3)走逐页对齐, 少页走全文比对
+    USE_PAGE_MATCHING = n_orig > 3 or n_comp > 3
+
     if has_ocr_orig and has_ocr_comp:
-        strategy = "行级匹配 (OCR vs OCR)"
+        base_strategy = "行级匹配 (OCR vs OCR)"
     elif has_ocr_orig or has_ocr_comp:
-        strategy = "行级匹配 (OCR vs Word)"
+        base_strategy = "行级匹配 (OCR vs Word)"
     else:
-        strategy = "段落级匹配 (Word vs Word)"
+        base_strategy = "段落级匹配 (Word vs Word)"
 
-    logger.info(f"比对策略: {strategy}")
+    if USE_PAGE_MATCHING:
+        strategy = base_strategy + " + 逐页对齐"
+    else:
+        strategy = base_strategy + " (全文比对)"
 
-    # 先全文比对（避免 Word 40段/页 vs PDF 真页边界不一致）
-    orig_all = "\n\n".join(p.get("text", "") for p in original_pages)
-    comp_all = "\n\n".join(p.get("text", "") for p in compared_pages)
+    logger.info(f"比对策略: {strategy} (原件{n_orig}页, 比对件{n_comp}页)")
 
-    orig_conf = min((p.get("confidence", 0.95) for p in original_pages), default=0.95)
-    comp_conf = min((p.get("confidence", 0.95) for p in compared_pages), default=0.95)
-    base_conf = min(orig_conf, comp_conf)
+    # ── 多页逐页对齐路径 ──
+    if USE_PAGE_MATCHING:
+        from comparator.page_matcher import match_and_compare_pages
 
-    logger.info(
-        f"开始比对: 原件={len(orig_all)}字, 比对件={len(comp_all)}字, "
-        f"策略={strategy}"
-    )
+        result = match_and_compare_pages(
+            original_pages=original_pages,
+            compared_pages=compared_pages,
+            page_threshold=0.5,
+            strategy=base_strategy,
+        )
 
-    from comparator.differ import compare
-    all_records = compare(
-        original_text=orig_all,
-        compared_text=comp_all,
-        page_label="全文比对",
-        base_confidence=base_conf,
-    )
+        all_records = result.all_records
+        summary = result.summary
+        page_alignment = result.page_alignment
 
-    # 转 dict
+    else:
+        # ── 少页全文比对路径(原有逻辑) ──
+        orig_all = "\n\n".join(p.get("text", "") for p in original_pages)
+        comp_all = "\n\n".join(p.get("text", "") for p in compared_pages)
+
+        orig_conf = min((p.get("confidence", 0.95) for p in original_pages), default=0.95)
+        comp_conf = min((p.get("confidence", 0.95) for p in compared_pages), default=0.95)
+        base_conf = min(orig_conf, comp_conf)
+
+        logger.info(
+            f"开始比对: 原件={len(orig_all)}字, 比对件={len(comp_all)}字"
+        )
+
+        from comparator.differ import compare
+        all_records = compare(
+            original_text=orig_all,
+            compared_text=comp_all,
+            page_label="全文比对",
+            base_confidence=base_conf,
+        )
+
+        summary = {
+            "total": len(all_records),
+            "modified": sum(1 for r in all_records if r.type == "modified"),
+            "deleted": sum(1 for r in all_records if r.type == "deleted"),
+            "added": sum(1 for r in all_records if r.type == "added"),
+        }
+        page_alignment = [{"orig_page": i, "comp_page": i, "similarity": 1.0}
+                          for i in range(min(n_orig, n_comp))]
+
+    # ── 转 dict (公共部分) ──
     records_data = []
     for r in all_records:
         records_data.append({
@@ -316,6 +356,8 @@ def handle_diff(params: dict) -> dict:
             "comparedText": r.compared_text,
             "confidence": r.confidence,
             "summary": r.summary,
+            "pageIndex": getattr(r, 'page_index', -1),
+            "matchedPageIndex": getattr(r, 'matched_page_index', -1),
             "fragments": [
                 {
                     "type": f.type,
@@ -331,18 +373,11 @@ def handle_diff(params: dict) -> dict:
             ],
         })
 
-    summary = {
-        "total": len(all_records),
-        "modified": sum(1 for r in all_records if r.type == "modified"),
-        "deleted": sum(1 for r in all_records if r.type == "deleted"),
-        "added": sum(1 for r in all_records if r.type == "added"),
-    }
-
     logger.info(
         f"比对完成: {summary['total']} 条差异 "
         f"(修改{summary['modified']}, 删除{summary['deleted']}, 新增{summary['added']})"
     )
-    for r in all_records[:5]:  # 前 5 条差异详情
+    for r in all_records[:5]:
         logger.info(
             f"  [{r.type}] {r.page_label}\n"
             f"    原件: {r.original_text[:80]}\n"
@@ -351,7 +386,15 @@ def handle_diff(params: dict) -> dict:
     if len(all_records) > 5:
         logger.info(f"  ... 共 {len(all_records)} 条差异")
 
-    return {"records": records_data, "summary": summary}
+    return {
+        "records": records_data,
+        "summary": summary,
+        "page_alignment": [
+            {"origPage": pa["orig_page"], "compPage": pa["comp_page"],
+             "similarity": pa["similarity"]}
+            for pa in page_alignment
+        ],
+    }
 
 
 # ── JSON-RPC 通信层 ──────────────────────────────────────
